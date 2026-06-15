@@ -1,0 +1,16 @@
+{
+  "name": "pi-todo",
+  "version": "1.0.0",
+  "description": "Persistent task ledger with sub-agent delegation for pi — plan, track, and farm out work across sub-agents with lean context",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
