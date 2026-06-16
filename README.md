@@ -47,6 +47,9 @@ pi install git:github.com/dvictor357/pi-todo
 | `agent` | Sub-agent type (e.g. `librarian`, `solana-dev`) |
 | `context` | Focused instructions for the sub-agent |
 | `result` | Brief summary of what the sub-agent did |
+| `source` | Optional — marks items originating from another extension (e.g. `quest`) |
+| `sourceId` | Optional — external source identifier |
+| `sourceIndex` | Optional — source-local task index |
 
 ### Commands
 
@@ -74,8 +77,20 @@ pi install git:github.com/dvictor357/pi-todo
 ~/.pi/agent/tmp/todos/
 ├── <cwd-hash>.json           # Current list
 └── archive/
+    ├── archive-index.json     # Lightweight manifest for fast history
     └── <cwd-hash>-<ts>.json  # Completed / cleared lists
 ```
+
+## Cross-extension cohesion
+
+pi-todo participates in the [cross-extension cohesion contract](https://github.com/dvictor357/pi-quest/blob/main/docs/cross-extension-cohesion.md) alongside pi-memory and pi-quest.
+
+- **External sync** — pi-quest writes quest-derived todo items directly to the same JSON file. pi-todo detects file mtime changes and reloads automatically, so the status bar and `/todo` always stay in sync.
+- **Source-preserving fields** — `source`, `sourceId`, and `sourceIndex` are preserved through load/save/archive cycles so externally-synced items retain their origin.
+- **Archive manifest** — `archive-index.json` provides O(1) history lookups instead of scanning every archived file.
+- **Session meta** — publishes item counts by status (pending, in_progress, delegated, completed) to `~/.pi/agent/session-meta.json`.
+
+All cross-extension writes are best-effort and wrapped in try/catch.
 
 ## Requirements
 

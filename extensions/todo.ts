@@ -26,7 +26,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, basename } from "node:path";
 
@@ -43,6 +43,12 @@ interface TodoItem {
 	context?: string;
 	/** Brief summary of what the sub-agent did or returned. */
 	result?: string;
+	/** Optional producer marker for cross-extension sync (e.g. quest). */
+	source?: string;
+	/** Optional external source id (e.g. quest name/id). */
+	sourceId?: string;
+	/** Optional source-local task index. */
+	sourceIndex?: number;
 	createdAt: number;
 	completedAt: number | null;
 }
@@ -60,17 +66,58 @@ const TRUNCATE_AT = 10;
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const TODO_DIR = join(AGENT_DIR, "tmp", "todos");
 const ARCHIVE_DIR = join(TODO_DIR, "archive");
+const SESSION_META_PATH = join(AGENT_DIR, "session-meta.json");
 
 // ── Storage ──────────────────────────────────────────────────────────────────
 
+function cwdHash(cwd: string): string {
+	return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
+}
+
+function readJSON<T>(path: string, fallback: T): T {
+	try {
+		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
+	} catch { /* corrupt → fallback */ }
+	return fallback;
+}
+
+function writeJSON(path: string, data: unknown): void {
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+	} catch { /* best-effort */ }
+}
+
+function writeSessionMeta(key: "memory" | "todo" | "quest", cwd: string, data: Record<string, unknown>): void {
+	try {
+		const existing = readJSON<{ cwd?: string; cwdHash?: string; updatedAt?: number; extensions?: Record<string, unknown> }>(SESSION_META_PATH, { extensions: {} });
+		const next = {
+			...existing,
+			cwd,
+			cwdHash: cwdHash(cwd),
+			updatedAt: Date.now(),
+			extensions: {
+				...(existing.extensions ?? {}),
+				[key]: { ...data, updatedAt: Date.now() },
+			},
+		};
+		writeJSON(SESSION_META_PATH, next);
+	} catch { /* best-effort cross-extension metadata */ }
+}
+
 function storePath(cwd: string): string {
-	const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-	return join(TODO_DIR, `${hash}.json`);
+	return join(TODO_DIR, `${cwdHash(cwd)}.json`);
 }
 
 function archivePath(cwd: string, timestamp: number): string {
-	const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-	return join(ARCHIVE_DIR, `${hash}-${timestamp}.json`);
+	return join(ARCHIVE_DIR, `${cwdHash(cwd)}-${timestamp}.json`);
+}
+
+function storeMtime(cwd: string): number | null {
+	try {
+		const p = storePath(cwd);
+		return existsSync(p) ? statSync(p).mtimeMs : null;
+	} catch { return null; }
 }
 
 function loadTodos(cwd: string): TodoList {
@@ -90,6 +137,9 @@ function loadTodos(cwd: string): TodoList {
 					agent: typeof i.agent === "string" ? i.agent : undefined,
 					context: typeof i.context === "string" ? i.context : undefined,
 					result: typeof i.result === "string" ? i.result : undefined,
+					source: typeof i.source === "string" ? i.source : undefined,
+					sourceId: typeof i.sourceId === "string" ? i.sourceId : undefined,
+					sourceIndex: typeof i.sourceIndex === "number" ? i.sourceIndex : undefined,
 					createdAt: typeof i.createdAt === "number" ? i.createdAt : Date.now(),
 					completedAt: typeof i.completedAt === "number" ? i.completedAt : null,
 				}));
@@ -100,9 +150,57 @@ function loadTodos(cwd: string): TodoList {
 }
 
 function saveTodos(list: TodoList): void {
+	writeJSON(storePath(list.cwd), list);
+}
+
+function writeTodoSessionMeta(cwd: string, list: TodoList): void {
+	const counts = {
+		pending: list.items.filter(i => i.status === "pending").length,
+		inProgress: list.items.filter(i => i.status === "in_progress").length,
+		delegated: list.items.filter(i => i.status === "delegated").length,
+		completed: list.items.filter(i => i.status === "completed").length,
+	};
+	writeSessionMeta("todo", cwd, {
+		title: list.title ?? null,
+		total: list.items.length,
+		...counts,
+	});
+}
+
+const TODO_ARCHIVE_INDEX_PATH = join(ARCHIVE_DIR, "archive-index.json");
+
+function updateTodoArchiveIndex(entry: { path: string; title: string | null; items: number; completed: number; archivedAt: number; cwdHash: string }): void {
 	try {
-		mkdirSync(TODO_DIR, { recursive: true });
-		writeFileSync(storePath(list.cwd), `${JSON.stringify(list, null, 2)}\n`, "utf8");
+		const index = readJSON<{ version: 1; entries: any[] }>(TODO_ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
+		index.entries = index.entries.filter((e: any) => e.path !== entry.path);
+		index.entries.push(entry);
+		index.entries.sort((a: any, b: any) => (b.archivedAt || 0) - (a.archivedAt || 0));
+		writeJSON(TODO_ARCHIVE_INDEX_PATH, index);
+	} catch { /* best-effort */ }
+}
+
+function rebuildTodoArchiveIndex(): void {
+	try {
+		if (!existsSync(ARCHIVE_DIR)) return;
+		const entries: any[] = [];
+		const files = readdirSync(ARCHIVE_DIR)
+			.filter(f => f.endsWith(".json") && f !== "archive-index.json");
+		for (const f of files) {
+			try {
+				const raw = JSON.parse(readFileSync(join(ARCHIVE_DIR, f), "utf8"));
+				const cwd = raw.cwd || "";
+				entries.push({
+					path: join(ARCHIVE_DIR, f),
+					title: raw.title || null,
+					items: Array.isArray(raw.items) ? raw.items.length : 0,
+					completed: Array.isArray(raw.items) ? raw.items.filter((i: any) => i.status === "completed").length : 0,
+					archivedAt: raw.archivedAt || 0,
+					cwdHash: cwd ? cwdHash(cwd) : "",
+				});
+			} catch { /* skip corrupt */ }
+		}
+		entries.sort((a: any, b: any) => (b.archivedAt || 0) - (a.archivedAt || 0));
+		writeJSON(TODO_ARCHIVE_INDEX_PATH, { version: 1, entries });
 	} catch { /* best-effort */ }
 }
 
@@ -115,30 +213,53 @@ function archiveList(list: TodoList): string | null {
 		const path = archivePath(list.cwd, ts);
 		const archived = { ...list, archivedAt: ts };
 		writeFileSync(path, `${JSON.stringify(archived, null, 2)}\n`, "utf8");
+		updateTodoArchiveIndex({
+			path,
+			title: list.title ?? null,
+			items: list.items.length,
+			completed: list.items.filter(i => i.status === "completed").length,
+			archivedAt: ts,
+			cwdHash: cwdHash(list.cwd),
+		});
 		return path;
 	} catch { return null; }
 }
 
 function listArchives(cwd: string): { path: string; title?: string; items: number; completed: number; archivedAt: number }[] {
 	try {
-		const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-		const prefix = `${hash}-`;
-		const files = readdirSync(ARCHIVE_DIR)
-			.filter(f => f.startsWith(prefix) && f.endsWith(".json"))
-			.sort()
-			.reverse();
-		return files.map(f => {
-			try {
-				const raw = JSON.parse(readFileSync(join(ARCHIVE_DIR, f), "utf8"));
-				return {
-					path: join(ARCHIVE_DIR, f),
-					title: raw.title,
-					items: Array.isArray(raw.items) ? raw.items.length : 0,
-					completed: Array.isArray(raw.items) ? raw.items.filter((i: any) => i.status === "completed").length : 0,
-					archivedAt: raw.archivedAt ?? 0,
-				};
-			} catch { return null; }
-		}).filter(Boolean) as any[];
+		if (!existsSync(ARCHIVE_DIR)) return [];
+		const hash = cwdHash(cwd);
+		// Try index first
+		const index = readJSON<{ version: 1; entries: any[] } | null>(TODO_ARCHIVE_INDEX_PATH, null);
+		if (index && Array.isArray(index.entries)) {
+			const matches = index.entries.filter((e: any) => e.cwdHash === hash);
+			if (matches.length > 0) {
+				return matches.map((e: any) => ({
+					path: e.path,
+					title: e.title || undefined,
+					items: e.items || 0,
+					completed: e.completed || 0,
+					archivedAt: e.archivedAt || 0,
+				}));
+			}
+			// No index matches — quick check if files exist for this cwd before rebuilding
+			const prefix = `${hash}-`;
+			if (!readdirSync(ARCHIVE_DIR).some(f => f.startsWith(prefix) && f.endsWith(".json"))) {
+				return [];
+			}
+		}
+		// Fallback: rebuild index from archive files
+		rebuildTodoArchiveIndex();
+		const rebuilt = readJSON<{ version: 1; entries: any[] }>(TODO_ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
+		return rebuilt.entries
+			.filter((e: any) => e.cwdHash === hash)
+			.map((e: any) => ({
+				path: e.path,
+				title: e.title || undefined,
+				items: e.items || 0,
+				completed: e.completed || 0,
+				archivedAt: e.archivedAt || 0,
+			}));
 	} catch { return []; }
 }
 
@@ -206,6 +327,9 @@ const TodoItemSchema = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Sub-agent type for delegated items (e.g. 'librarian', 'solana-dev')" })),
 	context: Type.Optional(Type.String({ description: "Focused context/instructions for the sub-agent — keep it lean" })),
 	result: Type.Optional(Type.String({ description: "Brief summary of what the sub-agent did (set when marking completed)" })),
+	source: Type.Optional(Type.String({ description: "Optional source extension marker (e.g. quest)" })),
+	sourceId: Type.Optional(Type.String({ description: "Optional external source id" })),
+	sourceIndex: Type.Optional(Type.Number({ description: "Optional source-local task index" })),
 });
 
 const TodoWriteParams = Type.Object({
@@ -218,11 +342,24 @@ const TodoWriteParams = Type.Object({
 // ── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	// In-memory cache so status badge doesn't re-read disk on model_select
+	// In-memory cache so status badge doesn't re-read disk on model_select,
+	// while still reloading when another extension writes the todo file.
 	let cachedList: TodoList | null = null;
+	let cachedCwd: string | null = null;
+	let cachedMtime: number | null = null;
+
+	function refreshCacheMetadata(cwd: string, list: TodoList): TodoList {
+		cachedList = list;
+		cachedCwd = cwd;
+		cachedMtime = storeMtime(cwd);
+		return list;
+	}
 
 	function getCached(cwd: string): TodoList {
-		if (!cachedList) cachedList = loadTodos(cwd);
+		const currentMtime = storeMtime(cwd);
+		if (!cachedList || cachedCwd !== cwd || cachedMtime !== currentMtime) {
+			return refreshCacheMetadata(cwd, loadTodos(cwd));
+		}
 		return cachedList;
 	}
 
@@ -292,6 +429,9 @@ export default function (pi: ExtensionAPI) {
 					agent: raw.agent,
 					context: raw.context,
 					result: raw.result,
+					source: typeof raw.source === "string" ? raw.source : prev?.item.source,
+					sourceId: typeof raw.sourceId === "string" ? raw.sourceId : prev?.item.sourceId,
+					sourceIndex: typeof raw.sourceIndex === "number" ? raw.sourceIndex : prev?.item.sourceIndex,
 					createdAt: prev?.item.createdAt ?? now,
 					completedAt: raw.status === "completed" ? (prev?.item.completedAt ?? now) : null,
 				};
@@ -311,8 +451,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			saveTodos(list);
-			cachedList = list;
+			refreshCacheMetadata(ctx.cwd, list);
 			renderStatus(ctx, list);
+			writeTodoSessionMeta(ctx.cwd, list);
 
 			const output = buildOutput(list, warnings);
 			return {
@@ -387,10 +528,15 @@ export default function (pi: ExtensionAPI) {
 	// ── Lifecycle ─────────────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_e, ctx) => {
-		cachedList = loadTodos(ctx.cwd);
-		renderStatus(ctx, cachedList);
+		const list = refreshCacheMetadata(ctx.cwd, loadTodos(ctx.cwd));
+		renderStatus(ctx, list);
+		writeTodoSessionMeta(ctx.cwd, list);
 	});
-	pi.on("model_select", async (_e, ctx) => renderStatus(ctx, getCached(ctx.cwd)));
+	pi.on("model_select", async (_e, ctx) => {
+		const list = getCached(ctx.cwd);
+		renderStatus(ctx, list);
+		writeTodoSessionMeta(ctx.cwd, list);
+	});
 
 	// ── Commands ──────────────────────────────────────────────────────────────
 
@@ -405,6 +551,7 @@ export default function (pi: ExtensionAPI) {
 				case "":
 				case "show": {
 					const list = getCached(ctx.cwd);
+					writeTodoSessionMeta(ctx.cwd, list);
 					if (list.items.length === 0) {
 						ctx.ui.notify("Todo list is empty.", "info");
 					} else {
@@ -420,8 +567,9 @@ export default function (pi: ExtensionAPI) {
 					}
 					const empty: TodoList = { cwd: ctx.cwd, items: [], version: 1 };
 					saveTodos(empty);
-					cachedList = empty;
+					refreshCacheMetadata(ctx.cwd, empty);
 					renderStatus(ctx, empty);
+					writeTodoSessionMeta(ctx.cwd, empty);
 					ctx.ui.notify("Todo list cleared.", "info");
 					return;
 				}
@@ -460,8 +608,9 @@ export default function (pi: ExtensionAPI) {
 					if (ctxMatch) item.context = ctxMatch[1];
 					item.status = "delegated";
 					saveTodos(list);
-					cachedList = list;
+					refreshCacheMetadata(ctx.cwd, list);
 					renderStatus(ctx, list);
+					writeTodoSessionMeta(ctx.cwd, list);
 					const agent = item.agent ? ` → ${item.agent}` : "";
 					ctx.ui.notify(`Delegated [${idx}] ${item.content}${agent}`, "info");
 					return;
