@@ -1,5 +1,9 @@
 # pi-todo
 
+> [!WARNING]
+> **Deprecated — this project now lives in [pi-suite](https://github.com/dvictor357/pi-suite).**
+> Development has moved to the consolidated `pi-suite` repository. This repo is archived and read-only; please use pi-suite going forward.
+
 Persistent task ledger with **sub-agent delegation** for [pi](https://pi.dev). Plan multi-step tasks, track progress, and farm out work to sub-agents — each with only the context they need.
 
 ## Features
